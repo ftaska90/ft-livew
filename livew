@@ -1,0 +1,423 @@
+#!/usr/bin/env bash
+# FT LiveW
+# Created by ft_aska.90
+# Copyright (c) 2026 ft_aska.90
+# SPDX-License-Identifier: MIT
+
+set -uo pipefail
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/livew"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/livew"
+LAST_WALLPAPER="$CONFIG_DIR/last_wallpaper"
+LAST_SOURCE="$CONFIG_DIR/last_source"
+
+PID_FILE="/tmp/livew.pid"
+LOG_FILE="/tmp/livew.log"
+ENCODE_LOG="/tmp/livew-encode.log"
+SOCKET_PREFIX="/tmp/livew-mpv"
+
+CACHE_WIDTH=1366
+CACHE_HEIGHT=768
+CACHE_FPS=15
+CACHE_CRF=26
+WATCH_INTERVAL="0.50"
+
+export LIBVA_DRIVER_NAME="${LIBVA_DRIVER_NAME:-i965}"
+
+mkdir -p "$CONFIG_DIR" "$CACHE_DIR"
+
+log() {
+    printf '[livew] %s\n' "$*" | tee -a "$LOG_FILE" >/dev/null
+}
+
+have() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+usage() {
+    cat <<'EOF'
+Usage:
+  livew [VIDEO_FILE]
+  livew --auto
+  livew --stop
+  livew --status
+
+Without an argument, livew opens a Zenity file picker when Zenity is available.
+
+Options:
+  --auto    Start the last selected wallpaper without opening a file picker.
+  --stop    Stop the running wallpaper/controller.
+  --status  Show current controller status.
+EOF
+}
+
+require_runtime() {
+    local missing=0
+    local cmd
+
+    for cmd in mpv xwinwrap xrandr xprop socat ffmpeg sha256sum; do
+        if ! have "$cmd"; then
+            printf 'livew: missing dependency: %s\n' "$cmd" >&2
+            missing=1
+        fi
+    done
+
+    return "$missing"
+}
+
+remove_stale_sockets() {
+    rm -f "${SOCKET_PREFIX}-"*.sock 2>/dev/null || true
+}
+
+controller_alive() {
+    [[ -r "$PID_FILE" ]] || return 1
+    local pid
+    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$pid" 2>/dev/null
+}
+
+stop_livew() {
+    local pid
+
+    if [[ -r "$PID_FILE" ]]; then
+        pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+        if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+            kill -TERM "$pid" 2>/dev/null || true
+
+            for _ in {1..30}; do
+                kill -0 "$pid" 2>/dev/null || break
+                sleep 0.10
+            done
+
+            if kill -0 "$pid" 2>/dev/null; then
+                kill -KILL "$pid" 2>/dev/null || true
+            fi
+        fi
+    fi
+
+    rm -f "$PID_FILE"
+    remove_stale_sockets
+}
+
+source_signature() {
+    local source="$1"
+    local real size mtime
+
+    real="$(readlink -f -- "$source" 2>/dev/null || printf '%s' "$source")"
+    size="$(stat -c '%s' -- "$source" 2>/dev/null || printf '0')"
+    mtime="$(stat -c '%Y' -- "$source" 2>/dev/null || printf '0')"
+
+    printf '%s\n%s\n%s\n%s\n%s\n%s\n' \
+        "$real" "$size" "$mtime" "$CACHE_WIDTH" "$CACHE_HEIGHT" "$CACHE_FPS" |
+        sha256sum | awk '{print $1}'
+}
+
+cache_path_for() {
+    local source="$1"
+    local sig
+    sig="$(source_signature "$source")"
+    printf '%s/%s-%sx%s-%sfps-crf%s.mp4\n' \
+        "$CACHE_DIR" "$sig" "$CACHE_WIDTH" "$CACHE_HEIGHT" "$CACHE_FPS" "$CACHE_CRF"
+}
+
+encode_cache() {
+    local source="$1"
+    local cache="$2"
+    local tmp="${cache}.part.$$"
+
+    if [[ -s "$cache" ]]; then
+        log "Using cached wallpaper: $cache"
+        return 0
+    fi
+
+    log "Preparing H.264 cache: ${CACHE_WIDTH}x${CACHE_HEIGHT} @ ${CACHE_FPS} FPS, CRF ${CACHE_CRF}"
+    : >"$ENCODE_LOG"
+
+    if ! ffmpeg -hide_banner -loglevel warning -y \
+        -i "$source" \
+        -an \
+        -vf "scale=${CACHE_WIDTH}:${CACHE_HEIGHT}:force_original_aspect_ratio=decrease,pad=${CACHE_WIDTH}:${CACHE_HEIGHT}:(ow-iw)/2:(oh-ih)/2,fps=${CACHE_FPS},format=yuv420p" \
+        -c:v libx264 \
+        -preset veryfast \
+        -crf "$CACHE_CRF" \
+        -movflags +faststart \
+        "$tmp" >>"$ENCODE_LOG" 2>&1; then
+        rm -f "$tmp"
+        printf 'livew: cache encode failed. See %s\n' "$ENCODE_LOG" >&2
+        return 1
+    fi
+
+    mv -f -- "$tmp" "$cache"
+    log "Cache ready: $cache"
+}
+
+monitor_geometries() {
+    xrandr --query 2>/dev/null |
+        awk '/ connected/ {
+            for (i=1; i<=NF; i++) {
+                if ($i ~ /^[0-9]+x[0-9]+\+[0-9]+\+[0-9]+$/) {
+                    print $1 " " $i
+                    break
+                }
+            }
+        }'
+}
+
+send_mpv() {
+    local socket="$1"
+    local payload="$2"
+
+    [[ -S "$socket" ]] || return 0
+    printf '%s\n' "$payload" | socat - "UNIX-CONNECT:$socket" >/dev/null 2>&1 || true
+}
+
+set_pause_all() {
+    local paused="$1"
+    local socket
+    local value=false
+
+    [[ "$paused" == "1" ]] && value=true
+
+    for socket in "${SOCKET_PREFIX}-"*.sock; do
+        [[ -S "$socket" ]] || continue
+        send_mpv "$socket" "{\"command\":[\"set_property\",\"pause\",${value}]}"
+    done
+}
+
+active_window_id() {
+    xprop -root _NET_ACTIVE_WINDOW 2>/dev/null |
+        sed -n 's/.*window id # \(0x[0-9a-fA-F]*\).*/\1/p'
+}
+
+window_should_pause() {
+    local wid="$1"
+    local state
+
+    [[ -n "$wid" && "$wid" != "0x0" ]] || return 1
+
+    state="$(xprop -id "$wid" _NET_WM_STATE 2>/dev/null || true)"
+
+    if grep -q '_NET_WM_STATE_FULLSCREEN' <<<"$state"; then
+        return 0
+    fi
+
+    if grep -q '_NET_WM_STATE_MAXIMIZED_VERT' <<<"$state" &&
+       grep -q '_NET_WM_STATE_MAXIMIZED_HORZ' <<<"$state"; then
+        return 0
+    fi
+
+    return 1
+}
+
+cleanup_controller() {
+    local pid
+
+    trap - EXIT INT TERM
+
+    set_pause_all 0
+
+    for pid in "${WRAP_PIDS[@]:-}"; do
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    done
+
+    sleep 0.15
+
+    for pid in "${WRAP_PIDS[@]:-}"; do
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+    done
+
+    remove_stale_sockets
+
+    if [[ -r "$PID_FILE" ]] && [[ "$(cat "$PID_FILE" 2>/dev/null || true)" == "$$" ]]; then
+        rm -f "$PID_FILE"
+    fi
+}
+
+run_controller() {
+    local cache="$1"
+    local source="$2"
+    local output geometry idx=0 socket wid last_pause=-1
+
+    declare -ag WRAP_PIDS=()
+
+    trap cleanup_controller EXIT
+    trap 'exit 0' INT TERM
+
+    printf '%s\n' "$$" >"$PID_FILE"
+    remove_stale_sockets
+
+    log "Starting wallpaper controller for: $source"
+
+    while read -r output geometry; do
+        [[ -n "$output" && -n "$geometry" ]] || continue
+
+        socket="${SOCKET_PREFIX}-${idx}.sock"
+        rm -f "$socket"
+
+        log "Monitor $output -> $geometry"
+
+        setsid xwinwrap \
+            -ov -ni -b -nf \
+            -g "$geometry" \
+            -- mpv \
+                --wid=WID \
+                --no-audio \
+                --loop-file=inf \
+                --no-osc \
+                --no-osd-bar \
+                --input-default-bindings=no \
+                --input-cursor=no \
+                --hwdec=vaapi \
+                --vo=gpu \
+                --gpu-api=opengl \
+                --video-sync=audio \
+                --input-ipc-server="$socket" \
+                --really-quiet \
+                "$cache" \
+            >>"$LOG_FILE" 2>&1 &
+
+        WRAP_PIDS+=("$!")
+        ((idx+=1))
+    done < <(monitor_geometries)
+
+    if ((idx == 0)); then
+        log "No active XRandR monitors detected."
+        return 1
+    fi
+
+    sleep 0.70
+
+    while :; do
+        local alive=0
+        local pid
+        for pid in "${WRAP_PIDS[@]}"; do
+            if kill -0 "$pid" 2>/dev/null; then
+                alive=1
+                break
+            fi
+        done
+
+        ((alive)) || break
+
+        wid="$(active_window_id)"
+
+        if window_should_pause "$wid"; then
+            if [[ "$last_pause" != "1" ]]; then
+                set_pause_all 1
+                last_pause=1
+                log "Wallpaper paused: fullscreen/maximized foreground window detected."
+            fi
+        else
+            if [[ "$last_pause" != "0" ]]; then
+                set_pause_all 0
+                last_pause=0
+                log "Wallpaper resumed."
+            fi
+        fi
+
+        sleep "$WATCH_INTERVAL"
+    done
+}
+
+choose_source() {
+    if ! have zenity; then
+        printf 'livew: no file supplied and zenity is unavailable.\n' >&2
+        return 1
+    fi
+
+    zenity --file-selection \
+        --title='Choose live wallpaper video' \
+        --file-filter='Video files | *.mp4 *.mkv *.webm *.mov *.avi *.m4v *.gif' \
+        --file-filter='All files | *' 2>/dev/null
+}
+
+start_source() {
+    local source="$1"
+    local cache
+
+    [[ -f "$source" ]] || {
+        printf 'livew: file not found: %s\n' "$source" >&2
+        return 1
+    }
+
+    require_runtime || return 1
+
+    source="$(readlink -f -- "$source")"
+    cache="$(cache_path_for "$source")"
+
+    encode_cache "$source" "$cache" || return 1
+
+    stop_livew
+
+    printf '%s\n' "$source" >"$LAST_SOURCE"
+    printf '%s\n' "$cache" >"$LAST_WALLPAPER"
+
+    nohup "$0" --daemon "$cache" "$source" >>"$LOG_FILE" 2>&1 &
+    disown 2>/dev/null || true
+
+    for _ in {1..30}; do
+        controller_alive && break
+        sleep 0.10
+    done
+
+    if controller_alive; then
+        log "Wallpaper started."
+        return 0
+    fi
+
+    printf 'livew: controller failed to start. See %s\n' "$LOG_FILE" >&2
+    return 1
+}
+
+main() {
+    local arg="${1:-}"
+
+    case "$arg" in
+        --daemon)
+            shift
+            [[ $# -ge 2 ]] || exit 2
+            run_controller "$1" "$2"
+            ;;
+
+        --stop)
+            stop_livew
+            ;;
+
+        --status)
+            if controller_alive; then
+                printf 'livew: running (PID %s)\n' "$(cat "$PID_FILE")"
+                [[ -r "$LAST_SOURCE" ]] && printf 'source: %s\n' "$(cat "$LAST_SOURCE")"
+            else
+                printf 'livew: stopped\n'
+            fi
+            ;;
+
+        --auto)
+            if [[ ! -r "$LAST_SOURCE" ]]; then
+                printf 'livew: no previous wallpaper saved in %s\n' "$LAST_SOURCE" >&2
+                exit 1
+            fi
+            start_source "$(cat "$LAST_SOURCE")"
+            ;;
+
+        -h|--help)
+            usage
+            ;;
+
+        '')
+            local source
+            source="$(choose_source)" || exit 1
+            [[ -n "$source" ]] || exit 0
+            start_source "$source"
+            ;;
+
+        *)
+            start_source "$arg"
+            ;;
+    esac
+}
+
+main "$@"
