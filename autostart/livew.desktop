@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=FT LiveW
+Comment=Restore the last FT LiveW wallpaper after login
+Exec=sh -lc 'sleep 10; "$HOME/.local/bin/livew" --auto'
+OnlyShowIn=XFCE;
+Terminal=false
+X-GNOME-Autostart-enabled=true
