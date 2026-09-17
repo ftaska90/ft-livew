@@ -1,0 +1,13 @@
+# Local runtime state
+.cache/
+.config/
+*.log
+*.pid
+*.sock
+
+# Temporary files
+*.tmp
+*.part
+*~
+*.swp
+*.swo
